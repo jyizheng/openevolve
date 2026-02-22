@@ -1,0 +1,22 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is gitignored — never commit it.
+
+aws_region  = "us-east-2"
+environment = "prod"
+
+# EC2 instance types for Batch Spot fleet.
+# Multiple types give the Spot allocator more capacity pools = fewer interruptions.
+instance_types = ["c5.2xlarge", "c5.4xlarge", "c5a.2xlarge", "c5a.4xlarge", "m5.2xlarge"]
+
+# Hard ceiling on total concurrent vCPUs across all jobs.
+# c5.2xlarge = 8 vCPUs, so 256 allows ~32 concurrent jobs.
+max_vcpus = 256
+
+# Short usernames — will become IAM users named "openevolve-<name>"
+iam_users = ["ron", "andy", "jiao"]
+
+# Alerts go here (job failures, budget thresholds)
+alert_email = "jyizheng@gmail.com"
+
+# Monthly AWS spend limit in USD before SNS alert fires
+monthly_budget_usd = 500

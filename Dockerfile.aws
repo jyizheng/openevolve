@@ -1,0 +1,67 @@
+# OpenEvolve — production Docker image for AWS Batch
+#
+# Designed for evaluators that compile code (Rust, C/C++, etc.).
+# Includes: Python 3.12, GCC/Clang, Rust toolchain, AWS CLI v2.
+# Add language-specific tools below if your evaluator needs them.
+
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# ── System build tools ────────────────────────────────────────────────────────
+# build-essential: gcc, g++, make, libc-dev (covers most C/C++ evaluators)
+# clang/cmake: common alternative compiler + build system
+# git: some evaluators clone dependencies
+# curl/unzip: needed for Rust installer and AWS CLI
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    g++ \
+    make \
+    cmake \
+    clang \
+    git \
+    curl \
+    unzip \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── AWS CLI v2 ────────────────────────────────────────────────────────────────
+# Used by the entrypoint for S3 sync (inputs download, checkpoint upload).
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+        -o /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/awscliv2.zip /tmp/aws \
+    && aws --version
+
+# ── Rust toolchain ────────────────────────────────────────────────────────────
+# Minimal profile = rustc + cargo only. Add components below if needed.
+ENV RUSTUP_HOME=/usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:${PATH}
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path \
+    && rustup component add rustfmt \
+    && cargo --version \
+    && rustc --version
+
+# ── OpenEvolve ────────────────────────────────────────────────────────────────
+WORKDIR /app
+COPY . /app
+
+RUN pip install --no-cache-dir -e . \
+    && python -c "import openevolve; print('openevolve import OK')"
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+# Default env vars — all overridable at job submit time
+ENV ITERATIONS=100
+ENV CONFIG_FILE=config.yaml
+ENV LOG_LEVEL=INFO
+
+ENTRYPOINT ["/docker-entrypoint.sh"]

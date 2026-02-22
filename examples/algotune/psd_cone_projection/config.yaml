@@ -1,5 +1,4 @@
-# Configuration for psd_cone_projection task - Optimized Gemini Flash 2.5
-# Achieved 1.64x AlgoTune Score with these settings
+# Configuration for psd_cone_projection task - OpenAI endpoint
 
 # General settings
 max_iterations: 100
@@ -11,12 +10,10 @@ max_code_length: 20000  # Increased from 10000 for deeper exploration
 
 # LLM Configuration
 llm:
-  api_base: "https://openrouter.ai/api/v1"
+  api_base: "https://api.openai.com/v1"
   models:
-    - name: "google/gemini-2.5-flash"
-      weight: 0.8
-    - name: "google/gemini-2.5-pro"
-      weight: 0.2
+    - name: "gpt-4.1"
+      weight: 1.0
   
   temperature: 0.4  # Optimal (better than 0.2, 0.6, 0.8)
   max_tokens: 128000  # Increased from 16000 for much richer context

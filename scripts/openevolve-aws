@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# openevolve-aws — CLI wrapper for submitting OpenEvolve jobs to AWS Batch
+#
+# Setup (one-time):
+#   export OPENEVOLVE_INPUT_BUCKET=openevolve-prod-inputs-xxxx
+#   export OPENEVOLVE_OUTPUT_BUCKET=openevolve-prod-outputs-xxxx
+#   export OPENEVOLVE_JOB_QUEUE=openevolve-prod-queue
+#   export OPENEVOLVE_JOB_DEFINITION=openevolve-prod-job
+#   export AWS_DEFAULT_REGION=us-east-1
+#
+# Usage:
+#   openevolve-aws submit --program my_prog.py --evaluator evaluator.py [--config cfg.yaml] [--iterations 500] [--vcpus 8] [--memory 14000]
+#   openevolve-aws status <batch-job-id>
+#   openevolve-aws logs   <batch-job-id> [--follow]
+#   openevolve-aws results <batch-job-id> [--output ./my-results]
+#   openevolve-aws list [RUNNING|SUCCEEDED|FAILED|PENDING]
+#   openevolve-aws cancel <batch-job-id>
+
+set -euo pipefail
+
+# ── Config from env ───────────────────────────────────────────────────────────
+INPUT_BUCKET="${OPENEVOLVE_INPUT_BUCKET:?Set OPENEVOLVE_INPUT_BUCKET (from terraform output cli_config)}"
+OUTPUT_BUCKET="${OPENEVOLVE_OUTPUT_BUCKET:?Set OPENEVOLVE_OUTPUT_BUCKET}"
+JOB_QUEUE="${OPENEVOLVE_JOB_QUEUE:?Set OPENEVOLVE_JOB_QUEUE}"
+JOB_DEFINITION="${OPENEVOLVE_JOB_DEFINITION:?Set OPENEVOLVE_JOB_DEFINITION}"
+REGION="${AWS_DEFAULT_REGION:-us-east-1}"
+
+# ── Derive the current user from the IAM identity ────────────────────────────
+# Works for:
+#   arn:aws:iam::123456789:user/openevolve-prod-alice  →  alice
+#   arn:aws:iam::123456789:root                        →  root
+_current_user() {
+    local arn name
+    arn=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)
+    # Extract the part after the last /; fall back to part after last : (for root)
+    name="${arn##*/}"
+    [[ "${name}" == "${arn}" ]] && name="${arn##*:}"
+    # Strip "openevolve-<env>-" prefix if present (e.g. openevolve-prod-)
+    name=$(echo "${name}" | sed 's/^openevolve-[^-]*-//')
+    echo "${name}"
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+_short_id() {
+    python3 -c "import uuid; print(str(uuid.uuid4()).split('-')[0])"
+}
+
+_bold() { printf '\033[1m%s\033[0m' "$*"; }
+
+usage() {
+    cat <<EOF
+$(_bold "openevolve-aws") — submit and manage OpenEvolve jobs on AWS Batch
+
+$(_bold COMMANDS)
+  submit    Upload inputs and queue an evolution job
+  status    Show job status and metadata
+  logs      Stream or show job logs from CloudWatch
+  results   Download job outputs from S3
+  list      List jobs in the queue
+  cancel    Cancel a running or pending job
+
+$(_bold "submit flags")
+  --program    <file>   Initial program file (required)
+  --evaluator  <file>   Evaluator file (required)
+  --config     <file>   OpenEvolve YAML config (optional)
+  --iterations <N>      Number of evolution iterations (default: 100)
+  --vcpus      <N>      Override vCPUs for this job (default: 8)
+  --memory     <MB>     Override memory for this job in MB (default: 14000)
+  --name       <str>    Custom job name (default: auto-generated)
+
+$(_bold EXAMPLES)
+  openevolve-aws submit --program prog.py --evaluator eval.py --iterations 500
+  openevolve-aws status  abc12345-...
+  openevolve-aws logs    abc12345-... --follow
+  openevolve-aws results abc12345-... --output ./run1
+  openevolve-aws list RUNNING
+  openevolve-aws cancel  abc12345-...
+EOF
+}
+
+# ── submit ────────────────────────────────────────────────────────────────────
+cmd_submit() {
+    local program="" evaluator="" config="" iterations=100
+    local vcpus=8 memory=14000 name=""
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --program)    program="$2";    shift 2 ;;
+            --evaluator)  evaluator="$2";  shift 2 ;;
+            --config)     config="$2";     shift 2 ;;
+            --iterations) iterations="$2"; shift 2 ;;
+            --vcpus)      vcpus="$2";      shift 2 ;;
+            --memory)     memory="$2";     shift 2 ;;
+            --name)       name="$2";       shift 2 ;;
+            *) echo "Unknown flag: $1"; usage; exit 1 ;;
+        esac
+    done
+
+    [[ -z "${program}"   ]] && { echo "Error: --program is required";   usage; exit 1; }
+    [[ -z "${evaluator}" ]] && { echo "Error: --evaluator is required"; usage; exit 1; }
+    [[ -f "${program}"   ]] || { echo "Error: file not found: ${program}";   exit 1; }
+    [[ -f "${evaluator}" ]] || { echo "Error: file not found: ${evaluator}"; exit 1; }
+
+    local username
+    username=$(_current_user)
+    local short_id
+    short_id=$(_short_id)
+
+    local s3_input="s3://${INPUT_BUCKET}/users/${username}/${short_id}/input"
+    local s3_output="s3://${OUTPUT_BUCKET}/users/${username}/${short_id}/output"
+    local job_name="${name:-openevolve-${username}-${short_id}}"
+
+    echo "Job short ID : ${short_id}"
+    echo "User         : ${username}"
+    echo "Iterations   : ${iterations}"
+    echo ""
+    echo "Uploading inputs to ${s3_input}..."
+    aws s3 cp "${program}"   "${s3_input}/initial_program.py"
+    aws s3 cp "${evaluator}" "${s3_input}/evaluator.py"
+    [[ -n "${config}" ]] && aws s3 cp "${config}" "${s3_input}/config.yaml"
+
+    echo "Submitting to Batch..."
+
+    # Build container overrides JSON
+    local overrides
+    overrides=$(python3 -c "
+import json, sys
+overrides = {
+    'vcpus': ${vcpus},
+    'memory': ${memory},
+    'environment': [
+        {'name': 'S3_INPUT_PREFIX',  'value': '${s3_input}'},
+        {'name': 'S3_OUTPUT_PREFIX', 'value': '${s3_output}'},
+        {'name': 'ITERATIONS',       'value': '${iterations}'},
+        {'name': 'JOB_OWNER',        'value': '${username}'},
+        {'name': 'JOB_SHORT_ID',     'value': '${short_id}'},
+    ]
+}
+print(json.dumps(overrides))
+")
+
+    local batch_job_id
+    batch_job_id=$(aws batch submit-job \
+        --job-name        "${job_name}" \
+        --job-queue       "${JOB_QUEUE}" \
+        --job-definition  "${JOB_DEFINITION}" \
+        --container-overrides "${overrides}" \
+        --tags "Owner=${username},ShortId=${short_id}" \
+        --region "${REGION}" \
+        --query 'jobId' \
+        --output text)
+
+    echo ""
+    echo "  Batch job ID : ${batch_job_id}"
+    echo "  Status       : SUBMITTED"
+    echo "  Results will appear at: ${s3_output}"
+    echo ""
+    echo "  Track progress:"
+    echo "    openevolve-aws status  ${batch_job_id}"
+    echo "    openevolve-aws logs    ${batch_job_id} --follow"
+    echo "    openevolve-aws results ${batch_job_id}"
+}
+
+# ── status ────────────────────────────────────────────────────────────────────
+cmd_status() {
+    local job_id="${1:?Usage: openevolve-aws status <job-id>}"
+
+    aws batch describe-jobs \
+        --jobs "${job_id}" \
+        --region "${REGION}" \
+        --query 'jobs[0].{
+            Status:status,
+            StatusReason:statusReason,
+            CreatedAt:createdAt,
+            StartedAt:startedAt,
+            StoppedAt:stoppedAt,
+            JobName:jobName,
+            Attempts:attempts[*].statusReason
+        }' \
+        --output yaml
+}
+
+# ── logs ──────────────────────────────────────────────────────────────────────
+cmd_logs() {
+    local job_id="${1:?Usage: openevolve-aws logs <job-id> [--follow]}"
+    shift
+    local follow=false
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --follow|-f) follow=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    local log_stream
+    log_stream=$(aws batch describe-jobs \
+        --jobs "${job_id}" \
+        --region "${REGION}" \
+        --query 'jobs[0].attempts[-1].container.logStreamName' \
+        --output text 2>/dev/null || echo "")
+
+    if [[ -z "${log_stream}" || "${log_stream}" == "None" ]]; then
+        echo "No log stream yet — job may still be queued or starting."
+        echo "Run: openevolve-aws status ${job_id}"
+        exit 0
+    fi
+
+    echo "Log stream: ${log_stream}"
+    echo "---"
+
+    if [[ "${follow}" == "true" ]]; then
+        aws logs tail "/aws/batch/openevolve" \
+            --log-stream-name-prefix "${log_stream}" \
+            --follow \
+            --region "${REGION}"
+    else
+        aws logs get-log-events \
+            --log-group-name "/aws/batch/openevolve" \
+            --log-stream-name "${log_stream}" \
+            --start-from-head \
+            --region "${REGION}" \
+            --query 'events[*].message' \
+            --output text
+    fi
+}
+
+# ── results ───────────────────────────────────────────────────────────────────
+cmd_results() {
+    local job_id="${1:?Usage: openevolve-aws results <job-id> [--output <dir>]}"
+    shift
+    local output_dir="./openevolve-results-${job_id:0:8}"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --output|-o) output_dir="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    # Retrieve the S3 output prefix from the job's container environment
+    local s3_output
+    s3_output=$(aws batch describe-jobs \
+        --jobs "${job_id}" \
+        --region "${REGION}" \
+        --query 'jobs[0].container.environment[?name==`S3_OUTPUT_PREFIX`].value' \
+        --output text 2>/dev/null || echo "")
+
+    if [[ -z "${s3_output}" || "${s3_output}" == "None" ]]; then
+        echo "Could not retrieve S3 output path from job metadata."
+        echo "Try: openevolve-aws status ${job_id}"
+        exit 1
+    fi
+
+    echo "Downloading results from ${s3_output}..."
+    mkdir -p "${output_dir}"
+    aws s3 sync "${s3_output}/" "${output_dir}/" \
+        --exclude "checkpoints/*" \
+        --region "${REGION}"
+
+    echo ""
+    echo "Results saved to: ${output_dir}"
+    echo "To also download checkpoints: aws s3 sync ${s3_output}/checkpoints/ ${output_dir}/checkpoints/"
+}
+
+# ── list ──────────────────────────────────────────────────────────────────────
+cmd_list() {
+    local status="${1:-RUNNING}"
+    echo "Jobs with status: ${status}"
+    echo ""
+    aws batch list-jobs \
+        --job-queue "${JOB_QUEUE}" \
+        --job-status "${status}" \
+        --region "${REGION}" \
+        --query 'jobSummaryList[*].{Name:jobName, Id:jobId, Status:status, Created:createdAt}' \
+        --output table
+}
+
+# ── cancel ────────────────────────────────────────────────────────────────────
+cmd_cancel() {
+    local job_id="${1:?Usage: openevolve-aws cancel <job-id>}"
+    aws batch cancel-job \
+        --job-id "${job_id}" \
+        --reason "Cancelled via openevolve-aws CLI" \
+        --region "${REGION}"
+    echo "Cancellation requested for job ${job_id}"
+}
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+COMMAND="${1:-help}"
+shift || true
+
+case "${COMMAND}" in
+    submit)  cmd_submit  "$@" ;;
+    status)  cmd_status  "$@" ;;
+    logs)    cmd_logs    "$@" ;;
+    results) cmd_results "$@" ;;
+    list)    cmd_list    "$@" ;;
+    cancel)  cmd_cancel  "$@" ;;
+    help|--help|-h) usage ;;
+    *)
+        echo "Unknown command: ${COMMAND}"
+        echo ""
+        usage
+        exit 1
+        ;;
+esac
