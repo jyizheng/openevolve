@@ -56,3 +56,15 @@ htmlcov/
 # For SR
 secrets.yaml
 problems
+
+# Terraform
+infra/terraform.tfvars
+infra/.terraform/
+infra/.terraform.lock.hcl
+infra/*.tfplan
+
+# AWS deployment runtime files
+env.sh
+submit.sh
+output.txt
+scripts/openevolve-results-*/
